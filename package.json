@@ -1,0 +1,22 @@
+{
+  "name": "echomarkledger-framework",
+  "version": "2.0.0",
+  "description": "为 Web 应用与网页游戏设计的防篡改操作账本 + 运行时防护框架",
+  "type": "module",
+  "license": "SEE LICENSE IN LICENSE",
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node tests/run.mjs",
+    "verify": "npm run build && npm test"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "fake-indexeddb": "^6.0.0"
+  }
+}

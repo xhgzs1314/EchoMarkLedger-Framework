@@ -1,149 +1,73 @@
-import { EchoMarkLedger } from './core/engine.js';
+/**
+ * 完整版入口（核心 + L1–L6 运行时防护）
+ * ============================================================================
+ * security.js 通过 import 显式依赖
+ * core/engine.js 与 core/storage.js，由打包器决定求值顺序。
+ */
+
+import { EchoMarkLedger, SAVE_FORMAT_VERSION } from './core/engine.js';
 import { QuadStorage } from './core/storage.js';
-import { 
-  sha256, sha256Sync, generateNonce, fisherYatesShuffle,
-  deriveRandomFromSeed, captureRuntimeContext, deepEqual,
-  serializeForHash, antiDebugDetection, deepFreeze,
-  deriveDynamicSalt, deriveOffset, safeStringify, computeSlotPosition
-} from './core/utils.js';
+import { captureRuntimeContext, deepFreeze, detectDebugSignals, debuggerTrapDetect } from './core/utils.js';
+import { destroyIdentity } from './core/keystore.js';
+import { migrateV1ToV2, verifyV1Save } from './migrate.js';
 import {
-  sealZeroTrustSystem,
-  quickSeal,
-  maximumSeal,
-  protectEngineInstance,
-  getSecurityReport,
-  SecurityLevel,
-  SecurityEventBus,
-  FingerprintEngine,
-  AntiHookEngine,
-  SealingSystem,
-  SecureEngineProxy,
-  DebugCountermeasures,
-  StorageHardening,
-  securityBus,
-  fingerprintEngine,
-  antiHookEngine,
-  sealingSystem,
-  debugCountermeasures,
-  storageHardening
+    sealZeroTrustSystem, quickSeal, maximumSeal, protectEngineInstance, getSecurityReport,
+    SecurityLevel, SecurityEventBus, FingerprintEngine, AntiHookEngine, SealingSystem,
+    SecureEngineProxy, DebugCountermeasures, StorageHardening,
+    securityBus, fingerprintEngine, antiHookEngine, sealingSystem,
+    debugCountermeasures, storageHardening,
 } from './extend/security.js';
-const coreExports = {
-  EchoMarkLedger,
-  QuadStorage,
-  sha256,
-  sha256Sync,
-  generateNonce,
-  fisherYatesShuffle,
-  deriveRandomFromSeed,
-  captureRuntimeContext,
-  deepEqual,
-  serializeForHash,
-  antiDebugDetection,
-  deepFreeze,
-  deriveDynamicSalt,
-  deriveOffset,
-  safeStringify,
-  computeSlotPosition
-};
-const securityExports = {
-  sealZeroTrustSystem,
-  quickSeal,
-  maximumSeal,
-  protectEngineInstance,
-  getSecurityReport,
-  SecurityLevel,
-  SecurityEventBus,
-  FingerprintEngine,
-  AntiHookEngine,
-  SealingSystem,
-  SecureEngineProxy,
-  DebugCountermeasures,
-  StorageHardening,
-  securityBus,
-  fingerprintEngine,
-  antiHookEngine,
-  sealingSystem,
-  debugCountermeasures,
-  storageHardening
-};
-const allExports = {
-  ...coreExports,
-  ...securityExports,
-  EchoMarkLedger,
-  QuadStorage
-};
+
+const EchoMarkSys = Object.freeze({
+    EchoMarkLedger,
+    QuadStorage,
+    SAVE_FORMAT_VERSION,
+    captureRuntimeContext,
+    deepFreeze,
+    detectDebugSignals,
+    debuggerTrapDetect,
+    migrateV1ToV2,
+    verifyV1Save,
+    destroyIdentity,
+    // 安全扩展
+    sealZeroTrustSystem,
+    quickSeal,
+    maximumSeal,
+    protectEngineInstance,
+    getSecurityReport,
+    SecurityLevel,
+    SecurityEventBus,
+    FingerprintEngine,
+    AntiHookEngine,
+    SealingSystem,
+    SecureEngineProxy,
+    DebugCountermeasures,
+    StorageHardening,
+    securityBus,
+    fingerprintEngine,
+    antiHookEngine,
+    sealingSystem,
+    debugCountermeasures,
+    storageHardening,
+});
+
 if (typeof window !== 'undefined') {
-  window.EchoMarkLedger = EchoMarkLedger;
-  window.QuadStorage = QuadStorage;
-  window.sha256 = sha256;
-  window.sha256Sync = sha256Sync;
-  window.generateNonce = generateNonce;
-  window.fisherYatesShuffle = fisherYatesShuffle;
-  window.deriveRandomFromSeed = deriveRandomFromSeed;
-  window.captureRuntimeContext = captureRuntimeContext;
-  window.deepEqual = deepEqual;
-  window.serializeForHash = serializeForHash;
-  window.antiDebugDetection = antiDebugDetection;
-  window.deepFreeze = deepFreeze;
-  window.deriveDynamicSalt = deriveDynamicSalt;
-  window.deriveOffset = deriveOffset;
-  window.safeStringify = safeStringify;
-  window.computeSlotPosition = computeSlotPosition;
-  window.sealZeroTrustSystem = sealZeroTrustSystem;
-  window.quickSeal = quickSeal;
-  window.maximumSeal = maximumSeal;
-  window.protectEngineInstance = protectEngineInstance;
-  window.getSecurityReport = getSecurityReport;
-  window.SecurityLevel = SecurityLevel;
-  window.SecurityEventBus = SecurityEventBus;
-  window.FingerprintEngine = FingerprintEngine;
-  window.AntiHookEngine = AntiHookEngine;
-  window.SealingSystem = SealingSystem;
-  window.SecureEngineProxy = SecureEngineProxy;
-  window.DebugCountermeasures = DebugCountermeasures;
-  window.StorageHardening = StorageHardening;
-  window.securityBus = securityBus;
-  window.fingerprintEngine = fingerprintEngine;
-  window.antiHookEngine = antiHookEngine;
-  window.sealingSystem = sealingSystem;
-  window.debugCountermeasures = debugCountermeasures;
-  window.storageHardening = storageHardening;
-  window.EchoMarkSys = allExports;
+    try {
+        Object.defineProperty(window, 'EchoMarkSys', {
+            value: EchoMarkSys, writable: false, configurable: false, enumerable: true,
+        });
+    } catch {  }
 }
+
 export {
-  EchoMarkLedger,
-  QuadStorage,
-  sha256,
-  sha256Sync,
-  generateNonce,
-  fisherYatesShuffle,
-  deriveRandomFromSeed,
-  captureRuntimeContext,
-  deepEqual,
-  serializeForHash,
-  antiDebugDetection,
-  deepFreeze,
-  deriveDynamicSalt,
-  deriveOffset,
-  safeStringify,
-  computeSlotPosition,
-  sealZeroTrustSystem,
-  quickSeal,
-  maximumSeal,
-  protectEngineInstance,
-  getSecurityReport,
-  SecurityLevel,
-  SecurityEventBus,
-  FingerprintEngine,
-  AntiHookEngine,
-  SealingSystem,
-  SecureEngineProxy,
-  DebugCountermeasures,
-  StorageHardening,
-  securityBus,
-  fingerprintEngine,
-  antiHookEngine,
-  sealingSystem,
-  debugCountermeasures,
-  storageHardening
+    EchoMarkLedger, QuadStorage, SAVE_FORMAT_VERSION,
+    captureRuntimeContext, deepFreeze, detectDebugSignals, debuggerTrapDetect,
+    migrateV1ToV2, verifyV1Save, destroyIdentity,
+    sealZeroTrustSystem, quickSeal, maximumSeal, protectEngineInstance, getSecurityReport,
+    SecurityLevel, SecurityEventBus, FingerprintEngine, AntiHookEngine, SealingSystem,
+    SecureEngineProxy, DebugCountermeasures, StorageHardening,
+    securityBus, fingerprintEngine, antiHookEngine, sealingSystem,
+    debugCountermeasures, storageHardening,
+    EchoMarkSys,
 };
+export default EchoMarkSys;

@@ -1,16 +1,13 @@
 @echo off
+REM
 echo ========================================
-echo Building EchoMarkLedger Version...
+echo EchoMarkLedger - build
 echo ========================================
-call esbuild src/entry.js --bundle --outfile=dist/EchoMarkLedger.js --format=iife --global-name=EchoMarkSys --minify --keep-names
-
-echo ========================================
-echo Building EchoMarkLedger ALL Version...
-echo ========================================
-call esbuild src/entry-full.js --bundle --outfile=dist/EchoMarkLedger-secure.js --format=iife --global-name=EchoMarkSys --minify --keep-names
-
-echo ========================================
-echo Built Finished
-echo   - dist/EchoMarkLedger.js       (core)
-echo   - dist/EchoMarkLedger-secure.js (all)
-echo ========================================
+call npm run build
+if errorlevel 1 (
+  echo.
+  echo 构建失败。若是首次使用，请先执行: npm install
+  exit /b 1
+)
+echo.
+echo 运行回归测试: npm test

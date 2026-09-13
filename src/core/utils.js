@@ -1,129 +1,65 @@
 /**
- * 工具函数模块
+ * 工具函数
+ * ============================================================================
+
  */
 
-async function sha256(input) {
-    const encoder = new TextEncoder();
-    const data = encoder.encode(String(input));
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+import { fastHash } from './crypto.js';
+
+function safeNumber(value, fallback = 0) {
+    return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
-function sha256Sync(input) {
-    // 备用
-    let h1 = 0x6a09e667, h2 = 0xbb67ae85, h3 = 0x3c6ef372, h4 = 0xa54ff53a;
-    const str = String(input);
-    for (let i = 0; i < str.length; i++) {
-        const c = str.charCodeAt(i);
-        h1 = ((h1 << 5) + h1 + c + (h1 >>> 27)) | 0;
-        h2 = ((h2 << 7) + h2 + c + (h2 >>> 25)) | 0;
-        h3 = ((h3 << 11) + h3 + c + (h3 >>> 21)) | 0;
-        h4 = ((h4 << 13) + h4 + c + (h4 >>> 19)) | 0;
-    }
-    const pad = (n) => (n >>> 0).toString(16).padStart(8, '0');
-    return (pad(h1) + pad(h2) + pad(h3) + pad(h4)).repeat(2).slice(0, 64);
-}
-
-function generateNonce(length = 16) {
-    const array = new Uint8Array(length);
-    crypto.getRandomValues(array);
-    return Array.from(array).map(b => b.toString(16).padStart(2, '0')).join('');
-}
-
-function fisherYatesShuffle(array, seed) {
-    const arr = [...array];
-    let state = parseInt(seed.slice(0, 16), 16) || 1;
-    const lcg = () => {
-        state = (state * 1664525 + 1013904223) % 4294967296;
-        return state / 4294967296;
-    };
-    for (let i = arr.length - 1; i > 0; i--) {
-        const j = Math.floor(lcg() * (i + 1));
-        [arr[i], arr[j]] = [arr[j], arr[i]];
-    }
-    return arr;
-}
-
-function deriveRandomFromSeed(seed, min, max) {
-    let state = parseInt(seed.slice(0, 16), 16) || 1;
-    const lcg = () => {
-        state = (state * 1664525 + 1013904223) % 4294967296;
-        return state / 4294967296;
-    };
-    lcg(); 
-    return Math.floor(lcg() * (max - min + 1)) + min;
-}
-
+/**
+ * 采集运行环境指纹。它的价值是"跨记录的环境漂移分析"（换设备、疑似自动化），
+ * 这类判断真正做起来应该在服务端（README §9.1 第 5 条），客户端只负责如实留痕。
+ */
 function captureRuntimeContext() {
+    const nav = typeof navigator !== 'undefined' ? navigator : {};
+    const scr = typeof screen !== 'undefined' ? screen : {};
+    const perf = typeof performance !== 'undefined' ? performance : null;
+
+    let timeZone = 'unknown';
+    try { timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone || 'unknown'; } catch { /* 忽略 */ }
+
     return {
-        memoryUsage: performance.memory ? performance.memory.usedJSHeapSize : 0,
-        userAgentHash: sha256Sync(navigator.userAgent),
-        screenSize: `${screen.width}x${screen.height}`,
-        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-        language: navigator.language,
-        platform: navigator.platform,
-        colorDepth: screen.colorDepth,
-        pixelRatio: window.devicePixelRatio || 1,
+        memoryUsage: safeNumber(perf?.memory?.usedJSHeapSize),
+        userAgentHash: fastHash(String(nav.userAgent || '')),
+        screenSize: `${safeNumber(scr.width)}x${safeNumber(scr.height)}`,
+        timeZone,
+        language: String(nav.language || 'unknown'),
+        platform: String(nav.platform || 'unknown'),
+        colorDepth: safeNumber(scr.colorDepth),
+        pixelRatio: safeNumber(typeof globalThis.devicePixelRatio === 'number' ? globalThis.devicePixelRatio : 1, 1),
         timestamp: Date.now(),
-        performanceNow: performance.now()
+        performanceNow: Math.round(safeNumber(perf?.now?.())),
     };
-}
-
-function deepEqual(a, b) {
-    if (a === b) return true;
-    if (a == null || b == null) return false;
-    if (typeof a !== typeof b) return false;
-    if (typeof a !== 'object') return false;
-    const keysA = Object.keys(a);
-    const keysB = Object.keys(b);
-    if (keysA.length !== keysB.length) return false;
-    for (const key of keysA) {
-        if (!keysB.includes(key)) return false;
-        if (!deepEqual(a[key], b[key])) return false;
-    }
-    return true;
-}
-
-function serializeForHash(obj) {
-    if (obj === null || obj === undefined) return '';
-    if (typeof obj === 'string') return obj;
-    if (typeof obj === 'number') return String(obj);
-    if (typeof obj === 'boolean') return obj ? '1' : '0';
-    if (Array.isArray(obj)) return obj.map(serializeForHash).join('|');
-    if (typeof obj === 'object') {
-        const keys = Object.keys(obj).sort();
-        return keys.map(k => `${k}:${serializeForHash(obj[k])}`).join(';');
-    }
-    return String(obj);
-}
-
-function antiDebugDetection() {
-    const start = performance.now();
-    (function(){})['constructor']('debugger')();
-    const end = performance.now();
-    const hasWebdriver = !!navigator.webdriver;
-    const hasChromeMissing = window.chrome && !window.chrome.loadTimes;
-    const hasNoPlugins = navigator.plugins.length === 0;
-    return (end - start) > 100 || hasWebdriver || hasChromeMissing || hasNoPlugins;
 }
 
 function deepFreeze(obj) {
     if (obj === null || typeof obj !== 'object') return obj;
     Object.freeze(obj);
-    Object.getOwnPropertyNames(obj).forEach(prop => {
-        if (obj[prop] !== null && typeof obj[prop] === 'object') deepFreeze(obj[prop]);
-    });
+    for (const prop of Object.getOwnPropertyNames(obj)) {
+        const value = obj[prop];
+        if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) deepFreeze(value);
+    }
     return obj;
 }
 
-async function deriveDynamicSalt(stateHash, offset, extra = '') {
-    return await sha256(`${stateHash}:${offset}:${extra}:${Date.now()}`);
-}
-
-async function deriveOffset(stateHash, operationType, timestamp, index) {
-    const hash = await sha256(`${stateHash}:${operationType}:${timestamp}:${index}`);
-    return parseInt(hash.slice(0, 8), 16) % 1000000;
+function deepEqual(a, b) {
+    if (a === b) return true;
+    if (a === null || b === null || a === undefined || b === undefined) return false;
+    if (typeof a !== typeof b) return false;
+    if (typeof a !== 'object') return false;
+    if (Array.isArray(a) !== Array.isArray(b)) return false;
+    const keysA = Object.keys(a);
+    const keysB = Object.keys(b);
+    if (keysA.length !== keysB.length) return false;
+    for (const key of keysA) {
+        if (!Object.prototype.hasOwnProperty.call(b, key)) return false;
+        if (!deepEqual(a[key], b[key])) return false;
+    }
+    return true;
 }
 
 function safeStringify(obj) {
@@ -136,13 +72,53 @@ function safeStringify(obj) {
         return value;
     });
 }
-function computeSlotPosition(logicalIndex, seed, slotSpace = 100000) {
-    const hash = sha256Sync(`${seed}:${logicalIndex}:slot`);
-    return parseInt(hash.slice(0, 12), 16) % slotSpace;
+
+/**
+ * 反调试启发式。
+ *
+ * v1 的 antiDebugDetection 有三个会误伤正常玩家的判据，已全部移除：
+ *   · navigator.plugins.length === 0 —— Firefox 与多数移动浏览器普遍命中；
+ *   · window.chrome && !window.chrome.loadTimes —— loadTimes 早已废弃；
+ *   · 每 2 秒执行一次 `new Function('debugger')()` —— 会真的冻住正常玩家的 DevTools。
+ * 任一命中就把 debugDetected 永久置真、之后所有 recordOperation 抛错，
+ * 结果是"正常玩家玩不了，作弊者照样作弊"。
+ *
+ * 现在只保留信噪比可接受的判据，并且返回"信号"而非"结论"——
+ * 由引擎累计多次命中后才认定，且默认只留痕不阻断。
+ */
+function detectDebugSignals() {
+    const signals = [];
+
+    // 自动化浏览器（Selenium / Puppeteer 默认会置位）
+    try {
+        if (typeof navigator !== 'undefined' && navigator.webdriver === true) signals.push('webdriver');
+    } catch { /* 忽略 */ }
+
+    // 时间侧信道：阈值给得很宽，避免把低端设备的卡顿当成断点
+    try {
+        const start = performance.now();
+        let acc = 0;
+        for (let i = 0; i < 20000; i++) acc += Math.sqrt(i);
+        const elapsed = performance.now() - start;
+        if (elapsed > 250) signals.push(`timing:${Math.round(elapsed)}ms`);
+        if (acc < 0) signals.push('impossible');   // 防止循环被优化掉
+    } catch { /* 忽略 */ }
+
+    return { suspicious: signals.length > 0, signals, at: Date.now() };
 }
-export { 
-  sha256, sha256Sync, generateNonce, fisherYatesShuffle, 
-  deriveRandomFromSeed, captureRuntimeContext, deepEqual, 
-  serializeForHash, antiDebugDetection, deepFreeze, 
-  deriveDynamicSalt, deriveOffset, safeStringify, computeSlotPosition 
+
+/**
+ * `debugger` 陷阱。会在 DevTools 打开时真的断下来，对正常玩家是明显的骚扰，
+ * 因此不进默认检测链；确实需要时由宿主自行按需调用。
+ */
+function debuggerTrapDetect(thresholdMs = 100) {
+    const start = performance.now();
+    // eslint-disable-next-line no-debugger
+    debugger;
+    return performance.now() - start > thresholdMs;
+}
+
+export {
+    captureRuntimeContext, deepFreeze, deepEqual, safeStringify,
+    detectDebugSignals, debuggerTrapDetect,
 };

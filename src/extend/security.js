@@ -1,44 +1,40 @@
 /**
  * ============================================================================
- * 运行时防篡改防护模块
- * ============================================================================
- * 
- * 防护层次：
- *   L1 - 模块封印 (Module Sealing)      : 冻结导出对象，防止属性覆盖
- *   L2 - 原型守卫 (Prototype Guard)     : 冻结类原型，防止原型链污染
- *   L3 - 指纹校验 (Fingerprint Check)  : 运行时计算函数指纹，检测替换
- *   L4 - 反 Hook 检测 (Anti-Hook)      : 检测 toString 篡改、Proxy 包装
- *   L5 - 状态监控 (State Monitor)       : 监控引擎实例关键属性的异常变更
- *   L6 - 安全事件总线 (Security Bus)    : 统一上报与分级响应
- * 
- * 加载要求：必须在 EchoMarkLedger.js 之后加载
- * 使用方式：import { sealZeroTrustSystem, SecurityLevel,protectEngineInstance } from './security.js'
- * 或script引入EchoMarkLedger-secure.js
- * ============================================================================
+ * 运行时防护模块 L1–L6
+
  */
-// 内部符号与隐蔽存储
-const _SYM_ORIGINALS = Symbol.for('ZTE._originals');
-const _SYM_FINGERPRINT = Symbol.for('ZTE._fingerprints');
-const _SYM_GUARD = Symbol.for('ZTE._guard');
-const _SYM_SEALED = Symbol.for('ZTE._sealed');
-const _SYM_PROXY = Symbol.for('ZTE._proxy');
-const _INTERNAL = new WeakMap();   // 实例
-const _GLOBAL = new Map();       // 模块
-// 安全级别枚举
+
+import { EchoMarkLedger } from '../core/engine.js';
+import { QuadStorage } from '../core/storage.js';
+import { sha256 } from '../core/crypto.js';
+import { deepFreeze, safeStringify, detectDebugSignals } from '../core/utils.js';
+
+const _GLOBAL = new Map();
+const _INTERNAL = new WeakMap();
+
 const SecurityLevel = Object.freeze({
-    STANDARD: 'standard',   // L1 + L2：基础封印
-    ENHANCED: 'enhanced',   // L1-L4：增加指纹与反 Hook
-    MAXIMUM: 'maximum'     // L1-L6：全功能开启
+    STANDARD: 'standard',   // L1 + L2
+    ENHANCED: 'enhanced',   // L1–L4
+    MAXIMUM: 'maximum',     // L1–L6
 });
-// 安全事件总线
+
+// 捕获原生引用，供 L4 比对
+const _nativeToString = Function.prototype.toString;
+const _nativeToStringSource = _nativeToString.call(_nativeToString);
+
+// ============================================================================
+// L6 安全事件总线
+// ============================================================================
 class SecurityEventBus {
     constructor() {
         this._listeners = new Map();
         this._threshold = { warn: 3, block: 5, destroy: 8 };
-        this._counters = new Map();   // 按类型计数
-        this._history = [];          // 事件日志
+        this._windowMs = 60000;        // 计数滑动窗口
+        this._events = new Map();      // `${severity}:${category}` -> 时间戳数组
+        this._history = [];
         this._maxHistory = 1000;
-        this._handler = null;        // 外部自定义处理器
+        this._handler = null;
+        this._destructing = false;     // 重入闸，修 v1 的无限递归
     }
 
     on(eventType, callback) {
@@ -50,410 +46,319 @@ class SecurityEventBus {
         if (typeof fn === 'function') this._handler = fn;
     }
 
+    /**
+     * 滑动窗口计数。v1 的计数器永不归零，长会话里偶发 warn 累积到 8 次
+     * 就会误触发自毁 —— 玩得越久越容易被自家安全模块打死。
+     */
+    _count(key, now) {
+        const stamps = (this._events.get(key) || []).filter((t) => now - t < this._windowMs);
+        stamps.push(now);
+        this._events.set(key, stamps);
+        return stamps.length;
+    }
+
     emit(severity, category, message, detail = {}) {
-        const event = {
-            timestamp: Date.now(),
-            severity,           // 'warn' | 'critical' | 'fatal'
-            category,           // 'tamper' | 'hook' | 'integrity' | 'state' | 'debug'
-            message,
-            detail: deepFreeze({ ...detail })
-        };
-        // 计数器
-        const key = `${severity}:${category}`;
-        this._counters.set(key, (this._counters.get(key) || 0) + 1);
-        const count = this._counters.get(key);
-        // 日志
+        const now = Date.now();
+        const event = { timestamp: now, severity, category, message, detail: deepFreeze({ ...detail }) };
+
+        const count = this._count(`${severity}:${category}`, now);
+
         this._history.push(event);
         if (this._history.length > this._maxHistory) this._history.shift();
 
-        // 外部处理器
         if (this._handler) {
-            try { this._handler(event); } catch (e) { }
+            try { this._handler(event); } catch { /* 宿主回调抛错不影响自身 */ }
         }
-        // 内置监听器
-        const listeners = this._listeners.get(category) || [];
-        for (const cb of listeners) {
-            try { cb(event); } catch (e) { }
+        for (const cb of this._listeners.get(category) || []) {
+            try { cb(event); } catch { /* 同上 */ }
         }
 
-        // 分级响应
-        if (severity === 'fatal' || count >= this._threshold.destroy) {
-            this._selfDestruct('安全阈值突破，执行自毁');
-        } else if (severity === 'critical' || count >= this._threshold.block) {
-            this._blockOperations('安全异常次数过多，暂停服务');
-        }
-        // 控制台警告
         if (typeof console !== 'undefined' && console.warn) {
-            console.warn(`[ZTE-SECURE] ${severity.toUpperCase()} | ${category}: ${message}`);
+            console.warn(`[EMK-SECURE] ${String(severity).toUpperCase()} | ${category}: ${message}`);
         }
+
+        // 已经在自毁流程里就不再分级响应，否则 fatal → 自毁 → fatal → … 无限递归
+        if (this._destructing || this.isDestroyed()) return event;
+
+        if (severity === 'fatal' || count >= this._threshold.destroy) {
+            this._selfDestruct(`安全阈值突破（${severity}:${category} 在 ${this._windowMs / 1000}s 内第 ${count} 次）`);
+        } else if (severity === 'critical' || count >= this._threshold.block) {
+            this._blockOperations(`安全异常次数过多（${severity}:${category} × ${count}）`);
+        }
+        return event;
     }
 
     _blockOperations(reason) {
+        if (_GLOBAL.get('operationsBlocked')) return;
         _GLOBAL.set('operationsBlocked', true);
         _GLOBAL.set('blockReason', reason);
-        this.emit('warn', 'system', `操作已被阻断: ${reason}`);
+        this._history.push({
+            timestamp: Date.now(), severity: 'warn', category: 'system',
+            message: `操作已被阻断: ${reason}`, detail: deepFreeze({}),
+        });
     }
 
+    /**
+     * 自毁：销毁引擎并置位。
+     * v1 在这里 emit('fatal') 导致无限递归；且它直接 throw，
+     * 把错误抛进了任意调用方的上下文。v2 只置位 + 销毁，
+     * 阻断由后续调用在入口处统一拒绝，不在事件流里抛异常。
+     */
     _selfDestruct(reason) {
-        _GLOBAL.set('selfDestructed', true);
+        if (this._destructing || _GLOBAL.get('selfDestructed')) return;
+        this._destructing = true;
         try {
+            _GLOBAL.set('selfDestructed', true);
+            _GLOBAL.set('destructReason', reason);
             const engine = _GLOBAL.get('activeEngine');
             if (engine && typeof engine.destroy === 'function') {
-                engine.destroy();
+                try { engine.destroy(); } catch { /* 已销毁 */ }
             }
-        } catch (e) { }
-        _GLOBAL.delete('activeEngine');
-        this.emit('fatal', 'system', `系统自毁: ${reason}`);
-        throw new Error(`EchoMarkLedger 安全自毁: ${reason}`);
+            _GLOBAL.delete('activeEngine');
+            this._history.push({
+                timestamp: Date.now(), severity: 'fatal', category: 'system',
+                message: `系统自毁: ${reason}`, detail: deepFreeze({}),
+            });
+            if (this._handler) {
+                try {
+                    this._handler({
+                        timestamp: Date.now(), severity: 'fatal', category: 'system',
+                        message: `系统自毁: ${reason}`, detail: deepFreeze({}),
+                    });
+                } catch { /* 忽略 */ }
+            }
+        } finally {
+            this._destructing = false;
+        }
     }
 
     getHistory() { return [...this._history]; }
     isBlocked() { return !!_GLOBAL.get('operationsBlocked'); }
     isDestroyed() { return !!_GLOBAL.get('selfDestructed'); }
+    blockReason() { return _GLOBAL.get('blockReason') || _GLOBAL.get('destructReason') || null; }
+
+    /** 测试与"玩家申诉后恢复"用。阻断在生产中应视为不可逆。 */
+    reset() {
+        this._events.clear();
+        this._history.length = 0;
+        this._destructing = false;
+        _GLOBAL.delete('operationsBlocked');
+        _GLOBAL.delete('blockReason');
+        _GLOBAL.delete('selfDestructed');
+        _GLOBAL.delete('destructReason');
+    }
 }
 const securityBus = new SecurityEventBus();
-// 指纹引擎
+
+// ============================================================================
+// L3 函数指纹（真 SHA-256）
+// ============================================================================
 class FingerprintEngine {
     constructor() {
-        this._registry = new Map();   // target -> { hash, descriptor }
-        this._checkInterval = null;
+        this._registry = new Map();
+        this._timer = null;
     }
 
-    /**
-     * 计算函数指纹(include-> toString、名称、参数长度、源码哈希
-     */
-    compute(fn) {
+    /** 归一化函数源码后取真 SHA-256。异步，因为 WebCrypto 是异步的。 */
+    async compute(fn) {
         if (typeof fn !== 'function') return null;
         try {
-            const name = fn.name || 'anonymous';
-            const length = fn.length;
-            const toStr = Function.prototype.toString.call(fn);
-            // 提取函数体
-            const body = toStr
+            const source = _nativeToString.call(fn)
                 .replace(/\/\/.*$/gm, '')
                 .replace(/\/\*[\s\S]*?\*\//g, '')
                 .replace(/\s+/g, ' ')
                 .trim();
-            const raw = `${name}:${length}:${body}`;
-            return sha256Sync(raw);
-        } catch (e) {
+            return await sha256(`${fn.name || 'anonymous'}:${fn.length}:${source}`);
+        } catch {
             return null;
         }
     }
 
-    register(name, target) {
-        const fp = this.compute(target);
-        if (fp) {
-            this._registry.set(name, {
-                target,
-                fingerprint: fp,
-                registeredAt: Date.now()
-            });
+    async register(name, target) {
+        const fingerprint = await this.compute(target);
+        if (fingerprint) {
+            this._registry.set(name, { target, fingerprint, registeredAt: Date.now() });
         }
-        return fp;
+        return fingerprint;
     }
 
-    verify(name) {
+    async verify(name) {
         const entry = this._registry.get(name);
         if (!entry) return { valid: false, reason: '未注册' };
-        const current = this.compute(entry.target);
+        const current = await this.compute(entry.target);
         if (!current) return { valid: false, reason: '无法计算指纹' };
         if (current !== entry.fingerprint) {
-            return {
-                valid: false,
-                reason: '指纹不匹配',
-                expected: entry.fingerprint,
-                actual: current
-            };
+            return { valid: false, reason: '指纹不匹配', expected: entry.fingerprint, actual: current };
         }
         return { valid: true };
     }
 
-    verifyAll() {
+    async verifyAll() {
         const results = [];
         let allValid = true;
-        for (const [name, entry] of this._registry) {
-            const result = this.verify(name);
+        for (const name of this._registry.keys()) {
+            const result = await this.verify(name);
             results.push({ name, ...result });
             if (!result.valid) allValid = false;
         }
         return { allValid, results };
     }
 
-    startMonitoring(intervalMs = 5000) {
-        if (this._checkInterval) return;
-        const jitter = () => Math.floor(Math.random() * 1000);
-        const check = () => {
-            const { allValid, results } = this.verifyAll();
+    startMonitoring(intervalMs = 8000) {
+        if (this._timer) return;
+        const tick = async () => {
+            const { allValid, results } = await this.verifyAll();
             if (!allValid) {
-                const failed = results.filter(r => !r.valid);
-                securityBus.emit('critical', 'integrity',
-                    `检测到 ${failed.length} 个函数指纹异常`,
-                    { failed: failed.map(f => ({ name: f.name, reason: f.reason })) }
-                );
+                const failed = results.filter((r) => !r.valid);
+                securityBus.emit('critical', 'integrity', `检测到 ${failed.length} 个函数指纹异常`, {
+                    failed: failed.map((f) => ({ name: f.name, reason: f.reason })),
+                });
             }
-            // 随机抖动
-            this._checkInterval = setTimeout(check, intervalMs + jitter());
+            this._timer = setTimeout(tick, intervalMs + Math.floor(Math.random() * 2000));
         };
-        this._checkInterval = setTimeout(check, intervalMs);
+        this._timer = setTimeout(tick, intervalMs);
     }
 
     stopMonitoring() {
-        if (this._checkInterval) {
-            clearTimeout(this._checkInterval);
-            this._checkInterval = null;
-        }
+        if (this._timer) { clearTimeout(this._timer); this._timer = null; }
     }
 }
 const fingerprintEngine = new FingerprintEngine();
-// 反 Hook 检测引擎
-class AntiHookEngine {
-    constructor() {
-        this._baselineToString = Function.prototype.toString;
-        this._baselineApply = Function.prototype.apply;
-        this._baselineCall = Function.prototype.call;
-        this._baselineBind = Function.prototype.bind;
-    }
 
+// ============================================================================
+// L4 反 Hook
+// ============================================================================
+class AntiHookEngine {
     /**
-     * 检测 Function.prototype.toString 是否被篡改
+     * 检测 Function.prototype.toString 是否被替换。
+     * 这是这一层里唯一信噪比可接受的判据：把模块加载期捕获的原生实现
+     * 与当前实现做比对。
+     *
+     * v1 还有 detectProxy()，靠 `toString().includes('Proxy')`、
+     * `Symbol.toStringTag === 'Proxy'` 之类猜测 —— 规范上 Proxy 对
+     * 这些都是透明的，这些判据既抓不到真 Proxy 又会误报箭头函数，已删除。
      */
     checkToStringIntegrity() {
         try {
-            const testFn = function nativeCheck() { return 42; };
-            const nativeStr = this._baselineToString.call(testFn);
-            const currentStr = testFn.toString();
-            // 如果 toString 被 hook
-            if (nativeStr !== currentStr) {
-                return {
-                    tampered: true,
-                    reason: 'Function.prototype.toString 被篡改',
-                    native: nativeStr,
-                    current: currentStr
-                };
+            if (Function.prototype.toString !== _nativeToString) {
+                return { tampered: true, reason: 'Function.prototype.toString 已被替换' };
+            }
+            if (_nativeToString.call(_nativeToString) !== _nativeToStringSource) {
+                return { tampered: true, reason: 'Function.prototype.toString 的源码表示已改变' };
             }
             return { tampered: false };
-        } catch (e) {
-            return { tampered: true, reason: `检测异常: ${e.message}` };
+        } catch (error) {
+            return { tampered: true, reason: `检测异常: ${error.message}` };
         }
     }
 
-    /**
-     * 检测目标函数是否被 Proxy 包装
-     */
-    detectProxy(target) {
-        if (typeof target !== 'function') return { proxied: false };
-        try {
-            // 检查 toString 结果是否包含 Proxy 特征
-            const str = Function.prototype.toString.call(target);
-            if (str.includes('Proxy')) {
-                return { proxied: true, reason: 'toString 包含 Proxy 标识' };
-            }
-
-            // C：一般Proxy 函数没有有效的 prototype 属性描述符
-            const protoDesc = Object.getOwnPropertyDescriptor(target, 'prototype');
-            if (!protoDesc) {
-                // 箭头函数也没有 prototype?
-                if (target.prototype === undefined) {
-                    // 可能箭头函数，也可能是 Proxy
-                    const nameDesc = Object.getOwnPropertyDescriptor(target, 'name');
-                    if (nameDesc && nameDesc.configurable === false) {
-                        return { proxied: false };
-                    }
-                }
-            }
-
-            // 检查 Symbol.toStringTag
-            const tag = target[Symbol.toStringTag];
-            if (tag === 'Proxy') {
-                return { proxied: true, reason: 'Symbol.toStringTag 返回 Proxy' };
-            }
-
-            // 检查是否为 revocable proxy
-            try {
-                const testObj = {};
-                const desc = Object.getOwnPropertyDescriptor(target, 'constructor');
-                if (!desc && target.prototype === undefined && target.length === 0) {
-                    return { proxied: false, suspicious: true };
-                }
-            } catch (e) {
-                return { proxied: true, reason: '属性访问异常' };
-            }
-
-            return { proxied: false };
-        } catch (e) {
-            return { proxied: true, reason: `检测异常: ${e.message}` };
-        }
+    /** 关键内置原型是否被冻结。仅作报告，不作判定。 */
+    checkPrototypeState() {
+        const protos = [
+            ['Object', Object.prototype], ['Array', Array.prototype], ['Function', Function.prototype],
+        ];
+        const details = protos.map(([name, proto]) => ({
+            proto: name, frozen: Object.isFrozen(proto), sealed: Object.isSealed(proto),
+        }));
+        return { allFrozen: details.every((d) => d.frozen), details };
     }
 
-    /**
-     * 检测内置对象是否被污染
-     */
-    checkPrototypePollution() {
-        const checks = [];
-        const criticalProtos = [Object.prototype, Array.prototype, Function.prototype];
-        for (const proto of criticalProtos) {
-            const frozen = Object.isFrozen(proto);
-            const sealed = Object.isSealed(proto);
-            checks.push({
-                proto: proto.constructor.name,
-                frozen,
-                sealed,
-                safe: frozen || sealed
-            });
-        }
-        const unsafe = checks.filter(c => !c.safe);
-        return {
-            safe: unsafe.length === 0,
-            allFrozen: checks.every(c => c.frozen),
-            details: checks
-        };
-    }
-
-    /**
-     * 综合扫描
-     */
-    fullScan(targetFunctions = []) {
-        const results = {
-            toStringOk: true,
-            proxyDetected: [],
-            prototypePollution: true,
-            timestamp: Date.now()
-        };
-
-        // toString 完整性
+    fullScan() {
+        const results = { toStringOk: true, prototypesFrozen: true, timestamp: Date.now() };
         const toStringCheck = this.checkToStringIntegrity();
         if (toStringCheck.tampered) {
             results.toStringOk = false;
             securityBus.emit('critical', 'hook', toStringCheck.reason, toStringCheck);
         }
-
-        // Proxy 检测
-        for (const [name, fn] of targetFunctions) {
-            const proxyCheck = this.detectProxy(fn);
-            if (proxyCheck.proxied) {
-                results.proxyDetected.push({ name, ...proxyCheck });
-                securityBus.emit('critical', 'hook', `函数 ${name} 被 Proxy 包装`, proxyCheck);
-            }
-        }
-
-        // 原型状态（仅记录）
-        const pollutionCheck = this.checkPrototypePollution();
-        if (!pollutionCheck.allFrozen) {
-            results.prototypePollution = false;
-        }
-
+        results.prototypesFrozen = this.checkPrototypeState().allFrozen;
         return results;
     }
 }
-
 const antiHookEngine = new AntiHookEngine();
-// 封印System
+
+// ============================================================================
+// L1 / L2 封印
+// ============================================================================
 class SealingSystem {
-    /**
-     * 封印函数
-     */
     sealFunction(target, propName, fn) {
         if (typeof fn !== 'function') return false;
         try {
             Object.defineProperty(target, propName, {
-                value: fn,
-                writable: false,
-                configurable: false,
-                enumerable: true
-            });
-            // 封印函数本身属性
-            Object.defineProperty(fn, 'name', {
-                value: fn.name,
-                configurable: false
+                value: fn, writable: false, configurable: false, enumerable: true,
             });
             return true;
-        } catch (e) {
-            securityBus.emit('warn', 'tamper', `封印函数 ${propName} 失败`, { error: e.message });
+        } catch (error) {
+            securityBus.emit('warn', 'tamper', `封印函数 ${propName} 失败`, { error: error.message });
             return false;
         }
     }
 
-    /**
-     * 封印类原型上所有方法
-     */
     sealClassPrototype(ClassConstructor, options = {}) {
         const { exclude = [], includeOnly = null } = options;
         const proto = ClassConstructor.prototype;
-        const descriptors = Object.getOwnPropertyDescriptors(proto);
-
-        for (const [name, desc] of Object.entries(descriptors)) {
-            if (name === 'constructor') continue;
-            if (exclude.includes(name)) continue;
+        for (const [name, desc] of Object.entries(Object.getOwnPropertyDescriptors(proto))) {
+            if (name === 'constructor' || exclude.includes(name)) continue;
             if (includeOnly && !includeOnly.includes(name)) continue;
-
-            if (typeof desc.value === 'function') {
-                this.sealFunction(proto, name, desc.value);
-            }
+            if (typeof desc.value === 'function') this.sealFunction(proto, name, desc.value);
         }
-
-        // 冻结原型本身
         try {
             Object.freeze(proto);
-        } catch (e) {
-            securityBus.emit('warn', 'tamper', `冻结 ${ClassConstructor.name}.prototype 失败`, { error: e.message });
+        } catch (error) {
+            securityBus.emit('warn', 'tamper', `冻结 ${ClassConstructor.name}.prototype 失败`, { error: error.message });
         }
     }
 
     /**
-     * 封印对象的所有可枚举属性
+     * 封印对象的自有属性。
+     * @param {string[]} exclude 运行期仍需写入的字段必须排除，否则会把实例弄坏
+     *        —— v1 就是漏了 QuadStorage 的 db，导致 init() 抛 TypeError。
      */
-    sealObjectProperties(obj, recursive = false) {
-        const descriptors = Object.getOwnPropertyDescriptors(obj);
-        for (const [key, desc] of Object.entries(descriptors)) {
+    sealObjectProperties(obj, { exclude = [], recursive = false } = {}) {
+        for (const [key, desc] of Object.entries(Object.getOwnPropertyDescriptors(obj))) {
+            if (exclude.includes(key)) continue;
+            if (desc.get || desc.set) continue;
             if (desc.writable || desc.configurable) {
                 try {
                     Object.defineProperty(obj, key, {
-                        value: desc.value,
-                        writable: false,
-                        configurable: false,
-                        enumerable: desc.enumerable
+                        value: desc.value, writable: false, configurable: false, enumerable: desc.enumerable,
                     });
-                } catch (e) {
-                }
+                } catch { /* 不可重定义则跳过 */ }
             }
             if (recursive && desc.value && typeof desc.value === 'object' && !Object.isFrozen(desc.value)) {
-                this.sealObjectProperties(desc.value, true);
+                this.sealObjectProperties(desc.value, { exclude, recursive: true });
             }
         }
     }
 
-    /**
-     * 封印模块导出对象
-     */
     sealModuleExports(exports) {
         if (exports && typeof exports === 'object') {
-            this.sealObjectProperties(exports, false);
-            try { Object.seal(exports); } catch (e) { }
+            this.sealObjectProperties(exports);
+            try { Object.freeze(exports); } catch { /* 忽略 */ }
         }
     }
 }
 const sealingSystem = new SealingSystem();
-// 安全代理包装器
+
+// ============================================================================
+// L5 引擎代理（可观测性 + 阻断闸门，不是安全边界）
+// ============================================================================
 class SecureEngineProxy {
     constructor(engineInstance, options = {}) {
         if (!(engineInstance instanceof EchoMarkLedger)) {
             throw new TypeError('SecureEngineProxy 只能包装 EchoMarkLedger 实例');
         }
-
         this._options = {
-            monitorProperties: ['records', 'currentIndex', 'currentHash', 'lastHook', 'genesisHash'],
+            // v2 的 records 已是私有字段，不在公开属性里；这里监控的是只读 getter，
+            // 它们本身已经无法被赋值，监控的意义在于发现"原型被换掉"这类异常。
+            monitorProperties: ['currentIndex', 'currentHash', 'lastHook', 'genesisHash'],
             blockOnTamper: true,
-            ...options
+            ...options,
         };
-
         this._original = engineInstance;
-        this._propertySnapshots = new Map();
+        this._snapshots = new Map();
         this._accessLog = [];
         this._maxLogSize = 500;
-        // 初始化快照
         this._takeSnapshot();
-        // 注册全局
         _GLOBAL.set('activeEngine', engineInstance);
         return this._createProxy();
     }
@@ -461,39 +366,15 @@ class SecureEngineProxy {
     _takeSnapshot() {
         for (const prop of this._options.monitorProperties) {
             try {
-                const val = this._original[prop];
-                this._propertySnapshots.set(prop, {
-                    type: typeof val,
-                    hash: typeof val === 'object' && val !== null
-                        ? sha256Sync(safeStringify(val))
-                        : String(val),
-                    timestamp: Date.now()
-                });
-            } catch (e) { }
+                const value = this._original[prop];
+                this._snapshots.set(prop, typeof value === 'object' && value !== null
+                    ? safeStringify(value) : String(value));
+            } catch { /* 取不到就跳过 */ }
         }
-    }
-
-    _verifySnapshot(prop, currentValue) {
-        const snapshot = this._propertySnapshots.get(prop);
-        if (!snapshot) return { ok: true };
-
-        const currentHash = typeof currentValue === 'object' && currentValue !== null
-            ? sha256Sync(safeStringify(currentValue))
-            : String(currentValue);
-
-        if (snapshot.hash !== currentHash) {
-            return {
-                ok: false,
-                reason: `${prop} 哈希不匹配`,
-                expected: snapshot.hash,
-                actual: currentHash
-            };
-        }
-        return { ok: true };
     }
 
     _logAccess(prop, action) {
-        this._accessLog.push({ prop, action, timestamp: Date.now() });
+        this._accessLog.push({ prop: String(prop), action, timestamp: Date.now() });
         if (this._accessLog.length > this._maxLogSize) this._accessLog.shift();
     }
 
@@ -501,388 +382,256 @@ class SecureEngineProxy {
         const self = this;
         const original = this._original;
 
+        const guard = (prop) => {
+            self._logAccess(prop, 'write-attempt');
+            securityBus.emit('critical', 'tamper', `尝试修改受保护属性 ${String(prop)}`, { prop: String(prop) });
+        };
+
         return new Proxy(original, {
-            get(target, prop, receiver) {
-                if (typeof prop === 'symbol' && prop !== _SYM_PROXY) {
-                    self._logAccess(prop.toString(), 'get');
-                }
-                const value = Reflect.get(target, prop, receiver);
-                // 检查属性描述符(read-only && non-configurable)
-                const desc = Object.getOwnPropertyDescriptor(target, prop);
-                if (desc && desc.writable === false && desc.configurable === false) {
-                    return value;
-                }
+            get(target, prop) {
+                // receiver 必须是 target：getter 与方法内部要访问 #私有字段，
+                // 用 proxy 当 receiver 会直接抛 TypeError。
+                const value = Reflect.get(target, prop, target);
 
                 if (typeof value === 'function') {
-                    const originalMethod = value;
-
                     return function (...args) {
-                        if (securityBus.isBlocked()) {
-                            throw new Error(`操作被安全模块阻断: ${_GLOBAL.get('blockReason') || '未知原因'}`);
-                        }
                         if (securityBus.isDestroyed()) {
-                            throw new Error('引擎已安全自毁');
+                            throw new Error(`引擎已安全自毁: ${securityBus.blockReason() || '未知原因'}`);
                         }
-
-                        if (['recordOperation', 'loadSave', 'exportSave', 'verifySave'].includes(prop)) {
-                            const entry = fingerprintEngine._registry.get(`EchoMarkLedger.prototype.${prop}`);
-                            if (entry) {
-                                const currentFp = fingerprintEngine.compute(originalMethod);
-                                if (currentFp && currentFp !== entry.fingerprint) {
-                                    securityBus.emit('critical', 'tamper', `方法 ${prop} 被篡改`);
-                                    if (self._options.blockOnTamper) {
-                                        throw new Error(`方法 ${prop} 完整性校验失败`);
-                                    }
-                                }
-                            }
+                        if (securityBus.isBlocked()) {
+                            throw new Error(`操作被安全模块阻断: ${securityBus.blockReason() || '未知原因'}`);
                         }
-
                         try {
-                            const result = originalMethod.apply(target, args);
+                            const result = value.apply(target, args);
                             if (result && typeof result.then === 'function') {
-                                return result.then(
-                                    res => { self._takeSnapshot(); return res; },
-                                    err => { throw err; }
-                                );
+                                return result.then((res) => { self._takeSnapshot(); return res; });
                             }
                             self._takeSnapshot();
                             return result;
-                        } catch (err) {
-                            securityBus.emit('warn', 'state', `方法 ${prop} 执行异常`, { error: err.message });
-                            throw err;
+                        } catch (error) {
+                            securityBus.emit('warn', 'state', `方法 ${String(prop)} 执行异常`, { error: error.message });
+                            throw error;
                         }
                     };
                 }
 
                 if (self._options.monitorProperties.includes(prop)) {
-                    const verify = self._verifySnapshot(prop, value);
-                    if (!verify.ok) {
-                        securityBus.emit('critical', 'state',
-                            `属性 ${prop} 在读取时被篡改`, verify);
+                    const snapshot = self._snapshots.get(prop);
+                    const current = typeof value === 'object' && value !== null ? safeStringify(value) : String(value);
+                    if (snapshot !== undefined && snapshot !== current) {
+                        securityBus.emit('critical', 'state', `属性 ${String(prop)} 在读取时与快照不一致`, {
+                            prop: String(prop),
+                        });
                     }
                 }
-
                 return value;
             },
 
+            // 引擎内部一律以 target 为 this 运行，永远不会经过这些陷阱，
+            // 所以这里可以无条件拒绝，不需要 v1 那种可被绕过的调用栈白名单。
             set(target, prop, value, receiver) {
-                self._logAccess(prop, 'set');
-                // 检查调用栈
-                const stack = new Error().stack || '';
-                const isInternalCall = stack.includes('recordOperation') ||
-                    stack.includes('loadSave') ||
-                    stack.includes('_freezeState') ||
-                    stack.includes('verifySave') ||
-                    stack.includes('_updateBackwardVerifications') ||
-                    stack.includes('_buildLinkedVerifications') ||
-                    stack.includes('_triggerSave') ||
-                    stack.includes('init') ||
-                    stack.includes('EchoMarkLedger');
-
-                if (self._options.monitorProperties.includes(prop) && !isInternalCall) {
-                    securityBus.emit('critical', 'tamper',
-                        `尝试非法修改属性 ${prop}`,
-                        { prop, attemptedValue: value });
+                if (self._options.monitorProperties.includes(prop)) {
+                    guard(prop);
                     if (self._options.blockOnTamper) {
-                        throw new Error(`属性 ${prop} 受安全模块保护，禁止修改`);
+                        throw new Error(`属性 ${String(prop)} 受安全模块保护，禁止修改`);
                     }
+                    return false;
                 }
-
+                self._logAccess(prop, 'set');
                 return Reflect.set(target, prop, value, receiver);
             },
 
             deleteProperty(target, prop) {
+                if (self._options.monitorProperties.includes(prop)) { guard(prop); return false; }
                 self._logAccess(prop, 'delete');
-                const stack = new Error().stack || '';
-                const isInternalCall = stack.includes('recordOperation') ||
-                    stack.includes('loadSave') ||
-                    stack.includes('_freezeState') ||
-                    stack.includes('verifySave') ||
-                    stack.includes('_updateBackwardVerifications') ||
-                    stack.includes('_buildLinkedVerifications') ||
-                    stack.includes('_triggerSave') ||
-                    stack.includes('init') ||
-                    stack.includes('EchoMarkLedger');
-
-                if (self._options.monitorProperties.includes(prop) && !isInternalCall) {
-                    securityBus.emit('critical', 'tamper', `尝试删除属性 ${prop}`);
-                    return false;
-                }
                 return Reflect.deleteProperty(target, prop);
             },
 
             defineProperty(target, prop, descriptor) {
+                if (self._options.monitorProperties.includes(prop)) { guard(prop); return false; }
                 self._logAccess(prop, 'define');
-                const stack = new Error().stack || '';
-                const isInternalCall = stack.includes('recordOperation') ||
-                    stack.includes('loadSave') ||
-                    stack.includes('_freezeState') ||
-                    stack.includes('verifySave') ||
-                    stack.includes('_updateBackwardVerifications') ||
-                    stack.includes('_buildLinkedVerifications') ||
-                    stack.includes('_triggerSave') ||
-                    stack.includes('init') ||
-                    stack.includes('EchoMarkLedger');
-
-                if (self._options.monitorProperties.includes(prop) && !isInternalCall) {
-                    securityBus.emit('critical', 'tamper', `尝试重定义属性 ${prop}`);
-                    return false;
-                }
                 return Reflect.defineProperty(target, prop, descriptor);
-            }
+            },
         });
     }
 }
-// 7. 调试对抗
+
+// ============================================================================
+// 调试对抗
+// ============================================================================
 class DebugCountermeasures {
     constructor() {
-        this._detectors = [];
-        this._interval = null;
-        this._debuggerTrap = null;
+        this._timers = [];
+        this._strikes = 0;
     }
-    /**
-     * 时间侧信道检测
-     */
-    enableTimingCheck(thresholdMs = 100) {
-        const check = () => {
-            const start = performance.now();
-            // 极短操作
-            for (let i = 0; i < 1000; i++) { Math.sqrt(i); }
-            const elapsed = performance.now() - start;
-            if (elapsed > thresholdMs) {
-                securityBus.emit('warn', 'debug', '检测到异常执行延迟，可能处于调试状态', { elapsed });
+
+    /** 连续多次命中才上报，单次抖动不算。 */
+    enableHeuristicProbe(intervalMs = 3000) {
+        const tick = () => {
+            const signals = detectDebugSignals();
+            if (signals.suspicious) {
+                if (++this._strikes >= 3) {
+                    this._strikes = 0;
+                    securityBus.emit('warn', 'debug', '连续多次检测到调试特征', { signals: signals.signals });
+                }
+            } else if (this._strikes > 0) {
+                this._strikes--;
             }
+            this._timers.push(setTimeout(tick, intervalMs + Math.floor(Math.random() * 1500)));
         };
-        this._detectors.push(setInterval(check, 3000));
+        this._timers.push(setTimeout(tick, intervalMs));
     }
 
     /**
-     * DevTools 特征检测
+     * 窗口尺寸差检测 DevTools。
+     * 误报面很大（缩放、扩展侧栏、分屏、移动端），只发 warn 供服务端做参考信号。
      */
-    enableDevToolsDetection() {
-        const threshold = 160;
-        const check = () => {
-            const widthDiff = window.outerWidth - window.innerWidth;
-            const heightDiff = window.outerHeight - window.innerHeight;
-            if (widthDiff > threshold || heightDiff > threshold) {
-                securityBus.emit('warn', 'debug', '检测到 DevTools 可能已打开', {
-                    widthDiff, heightDiff
-                });
-            }
+    enableDevToolsDetection(intervalMs = 4000, threshold = 200) {
+        const tick = () => {
+            try {
+                const widthDiff = window.outerWidth - window.innerWidth;
+                const heightDiff = window.outerHeight - window.innerHeight;
+                if (widthDiff > threshold || heightDiff > threshold) {
+                    securityBus.emit('warn', 'debug', '窗口尺寸差异提示 DevTools 可能已打开', { widthDiff, heightDiff });
+                }
+            } catch { /* 忽略 */ }
+            this._timers.push(setTimeout(tick, intervalMs));
         };
-        this._detectors.push(setInterval(check, 2000));
-    }
-
-    /**
-     * debugger 陷阱
-     */
-    enableDebuggerTrap() {
-        const trap = new Function('if (false) debugger;');
-        this._debuggerTrap = setInterval(() => {
-            try { trap(); } catch (e) { }
-        }, 5000);
-    }
-
-    /**
-     * 检测 console 是否被打开
-     */
-    enableConsoleDetection() {
-        const check = () => {
-            const element = new Image();
-            let detected = false;
-            Object.defineProperty(element, 'id', {
-                get: () => { detected = true; return 'dev'; }
-            });
-            console.log('%c', element);
-            if (detected) {
-                securityBus.emit('warn', 'debug', '通过 console 副作用检测到 DevTools');
-            }
-        };
-        this._detectors.push(setInterval(check, 5000));
+        this._timers.push(setTimeout(tick, intervalMs));
     }
 
     startAll() {
-        this.enableTimingCheck();
+        this.enableHeuristicProbe();
         this.enableDevToolsDetection();
-        this.enableDebuggerTrap();
-        // console 检测在某些浏览器可能误报,自行判断是否启用
-        // this.enableConsoleDetection();
+        // v1 还有 enableDebuggerTrap()：每 5s 执行一次 `debugger`。
+        // 它会真的冻住正常玩家打开的 DevTools，属于骚扰而非防护，不再提供。
     }
 
     stopAll() {
-        for (const id of this._detectors) clearInterval(id);
-        this._detectors = [];
-        if (this._debuggerTrap) clearInterval(this._debuggerTrap);
+        for (const id of this._timers) clearTimeout(id);
+        this._timers = [];
+        this._strikes = 0;
     }
 }
 const debugCountermeasures = new DebugCountermeasures();
-// 存储层加固
-class StorageHardening {
-    constructor() {
-        this._originalMethods = new WeakMap();
-    }
 
-    /**
-     * 为 QuadStorage 实例添加访问日志和完整性校验
-     */
+// ============================================================================
+// 存储层加固
+// ============================================================================
+/** 运行期仍需写入的字段。封成只读会把实例弄坏（v1 漏了 db，init() 直接抛错）。 */
+const STORAGE_MUTABLE_FIELDS = Object.freeze(['db', '_macFn']);
+
+class StorageHardening {
     harden(storageInstance) {
         if (!(storageInstance instanceof QuadStorage)) return storageInstance;
         if (_INTERNAL.has(storageInstance)) return storageInstance;
-        const self = this;
+
         const criticalMethods = [
-            'writeRecord', 'readRecord', 'writeToStore',
-            'readFromStoreByIndex', 'clearAll', 'clearStore',
-            'verifyIntegrity', 'exportAll', 'importAll'
+            'writeRecord', 'readRecord', 'writeToStore', 'readFromStoreByIndex',
+            'clearAll', 'clearStore', 'verifyIntegrity', 'exportAll', 'importAll',
         ];
         const originals = new Map();
+
         for (const method of criticalMethods) {
             const original = storageInstance[method];
             if (typeof original !== 'function') continue;
             originals.set(method, original);
-            const wrapped = async function (...args) {
-                // 校验调用者身份
-                const stack = new Error().stack || '';
-                const isAuthorized = stack.includes('EchoMarkLedger') || stack.includes('help.js');
-                if (!isAuthorized) {
-                    securityBus.emit('warn', 'tamper',
-                        `QuadStorage.${method} 被非授权调用`,
-                        { stack: stack.split('\n').slice(0, 4).join('\n') });
-                }
 
+            // 只记录、不判定。v1 在这里用 stack.includes('EchoMarkLedger') 判断
+            // "是否授权调用"，那既拦不住有心人，又会因为文件路径含关键字而失效。
+            const wrapped = async function (...args) {
                 try {
-                    const result = await original.apply(this, args);
-                    return result;
-                } catch (e) {
-                    securityBus.emit('critical', 'tamper',
-                        `QuadStorage.${method} 执行异常`, { error: e.message });
-                    throw e;
+                    return await original.apply(this, args);
+                } catch (error) {
+                    securityBus.emit('warn', 'integrity', `QuadStorage.${method} 执行异常`, { error: error.message });
+                    throw error;
                 }
             };
 
-            // 使用 defineProperty 替换
             try {
                 Object.defineProperty(storageInstance, method, {
-                    value: wrapped,
-                    writable: false,
-                    configurable: false,
-                    enumerable: true
+                    value: wrapped, writable: false, configurable: false, enumerable: true,
                 });
-            } catch (e) {
+            } catch {
                 storageInstance[method] = wrapped;
             }
         }
 
-        // 封印实例属性
-        sealingSystem.sealObjectProperties(storageInstance);
-        // 标记
+        sealingSystem.sealObjectProperties(storageInstance, { exclude: STORAGE_MUTABLE_FIELDS });
         _INTERNAL.set(storageInstance, { hardened: true, originals });
         return storageInstance;
     }
 
-    /**
-     * 恢复原始方法
-     */
     restore(storageInstance) {
         const internal = _INTERNAL.get(storageInstance);
-        if (!internal || !internal.originals) return;
+        if (!internal) return;
         for (const [method, original] of internal.originals) {
             try {
                 Object.defineProperty(storageInstance, method, {
-                    value: original,
-                    writable: true,
-                    configurable: true,
-                    enumerable: true
+                    value: original, writable: true, configurable: true, enumerable: true,
                 });
-            } catch (e) {
-                storageInstance[method] = original;
-            }
+            } catch { /* 已不可配置 */ }
         }
         _INTERNAL.delete(storageInstance);
     }
 }
-
 const storageHardening = new StorageHardening();
+
+// ============================================================================
 // 主入口
+// ============================================================================
+const ENGINE_PROTO_METHODS = [
+    'recordOperation', 'loadSave', 'exportSave', 'verifySave',
+    'getCurrentState', 'getHistory', 'rekey',
+];
+const STORAGE_PROTO_METHODS = [
+    'init', 'clearAll', 'clearStore', 'writeRecord', 'readRecord', 'buildRows',
+    'writeToStore', 'readFromStoreByIndex', 'getAllFromStore',
+    'verifyIntegrity', 'exportAll', 'importAll', 'close',
+];
+
 /**
- * 封印 EchoMarkLedger 系统
+ * 封印系统。
  * @param {Object} options
- * @param {string} options.level - SecurityLevel 之一
- * @param {Function} options.onSecurityEvent - 安全事件回调
- * @param {boolean} options.hardenStorage - 是否加固存储层
- * @param {boolean} options.enableDebugCountermeasures - 是否启用反调试
- * @returns {Object} 封印后的导出对象
+ * @param {string}   options.level                      SecurityLevel 之一
+ * @param {Function} options.onSecurityEvent            安全事件回调
+ * @param {boolean}  options.hardenStorage              是否加固存储层（默认 true）
+ * @param {boolean}  options.enableDebugCountermeasures 是否启用反调试（默认随 level）
  */
-function sealZeroTrustSystem(options = {}) {
+async function sealZeroTrustSystem(options = {}) {
     const level = options.level || SecurityLevel.ENHANCED;
-    if (options.onSecurityEvent) {
-        securityBus.setExternalHandler(options.onSecurityEvent);
-    }
-    const utilsExports = {
-        sha256, sha256Sync, generateNonce, fisherYatesShuffle,
-        deriveRandomFromSeed, captureRuntimeContext, deepEqual,
-        serializeForHash, antiDebugDetection, deepFreeze,
-        deriveDynamicSalt, deriveOffset, safeStringify, computeSlotPosition
-    };
-    sealingSystem.sealModuleExports(utilsExports);
-    for (const [name, fn] of Object.entries(utilsExports)) {
-        fingerprintEngine.register(`utils.${name}`, fn);
-    }
-    sealingSystem.sealClassPrototype(EchoMarkLedger, {
-        exclude: ['constructor', 'destroy']  // destroy 允许调用
-    });
+    if (options.onSecurityEvent) securityBus.setExternalHandler(options.onSecurityEvent);
+
+    // L2：冻结原型。destroy 保留可调用；构造函数里的 _setupMethodProtection
+    // 依赖能在实例上定义同名属性，所以原型方法冻结不影响它。
+    sealingSystem.sealClassPrototype(EchoMarkLedger, { exclude: ['destroy'] });
     sealingSystem.sealClassPrototype(QuadStorage);
-    const engineProtoMethods = [
-        'recordOperation', 'loadSave', 'exportSave', 'verifySave',
-        'getCurrentState', 'getHistory', '_generateHook',
-        '_buildLinkedVerifications', '_updateBackwardVerifications',
-        '_deriveStableSalt', '_getRecentStateHashes'
-    ];
-    for (const name of engineProtoMethods) {
+
+    // L3：注册指纹
+    for (const name of ENGINE_PROTO_METHODS) {
         if (typeof EchoMarkLedger.prototype[name] === 'function') {
-            fingerprintEngine.register(`EchoMarkLedger.prototype.${name}`, EchoMarkLedger.prototype[name]);
+            await fingerprintEngine.register(`EchoMarkLedger.prototype.${name}`, EchoMarkLedger.prototype[name]);
         }
     }
-
-    const storageProtoMethods = [
-        'init', 'clearAll', 'clearStore', 'writeRecord', 'readRecord',
-        'writeToStore', 'readFromStoreByIndex', 'getAllFromStore',
-        'verifyIntegrity', 'exportAll', 'importAll', 'close'
-    ];
-    for (const name of storageProtoMethods) {
+    for (const name of STORAGE_PROTO_METHODS) {
         if (typeof QuadStorage.prototype[name] === 'function') {
-            fingerprintEngine.register(`QuadStorage.prototype.${name}`, QuadStorage.prototype[name]);
+            await fingerprintEngine.register(`QuadStorage.prototype.${name}`, QuadStorage.prototype[name]);
         }
     }
-    // L3-L4: 增强级与最高级开启指纹监控和反 Hook
-    if (level === SecurityLevel.ENHANCED || level === SecurityLevel.MAXIMUM) {
-        // 指纹定时校验
-        fingerprintEngine.startMonitoring(8000);
-        // Hook 扫描
-        const targetFunctions = [
-            ...Object.entries(utilsExports),
-            ...engineProtoMethods.map(m => [`EchoMarkLedger.prototype.${m}`, EchoMarkLedger.prototype[m]]),
-            ...storageProtoMethods.map(m => [`QuadStorage.prototype.${m}`, QuadStorage.prototype[m]])
-        ].filter(([, fn]) => typeof fn === 'function');
 
-        antiHookEngine.fullScan(targetFunctions);
+    if (level === SecurityLevel.ENHANCED || level === SecurityLevel.MAXIMUM) {
+        fingerprintEngine.startMonitoring(8000);
+        antiHookEngine.fullScan();
     }
-    // L5-L6: 状态监控和反调试
-    if (level === SecurityLevel.MAXIMUM) {
-        if (options.enableDebugCountermeasures !== false) {
-            debugCountermeasures.startAll();
-        }
+    if (level === SecurityLevel.MAXIMUM && options.enableDebugCountermeasures !== false) {
+        debugCountermeasures.startAll();
     }
+
     const shouldHardenStorage = options.hardenStorage !== false;
+
     const sealedExports = Object.freeze({
-        // 原始类
         EchoMarkLedger,
         QuadStorage,
-        // 工具函数
-        sha256, sha256Sync, generateNonce, fisherYatesShuffle,
-        deriveRandomFromSeed, captureRuntimeContext, deepEqual,
-        serializeForHash, antiDebugDetection, deepFreeze,
-        deriveDynamicSalt, deriveOffset, safeStringify, computeSlotPosition,
-        // 安全基础设施
         SecurityLevel,
         securityBus,
         fingerprintEngine,
@@ -890,95 +639,66 @@ function sealZeroTrustSystem(options = {}) {
         sealingSystem,
         debugCountermeasures,
         storageHardening,
-        // 高级 API
         SecureEngineProxy,
+        protectEngineInstance,
+        getSecurityReport,
         sealZeroTrustSystem,
-        // 便捷方法
-        createSecureEngine: (opts) => {
-            const engine = new EchoMarkLedger(opts);
-            if (shouldHardenStorage && engine.storage) {
-                storageHardening.harden(engine.storage);
-            }
-            if (level === SecurityLevel.MAXIMUM) {
-                return new SecureEngineProxy(engine);
-            }
+
+        /** 创建受保护引擎。MAXIMUM 级别返回 SecureEngineProxy 包装。 */
+        createSecureEngine(engineOptions) {
+            const engine = new EchoMarkLedger(engineOptions);
+            if (shouldHardenStorage && engine.storage) storageHardening.harden(engine.storage);
+            if (level === SecurityLevel.MAXIMUM) return new SecureEngineProxy(engine);
+            _GLOBAL.set('activeEngine', engine);
             return engine;
-        }
+        },
     });
 
-    // 将封印标记写入全局
     _GLOBAL.set('sealed', true);
     _GLOBAL.set('securityLevel', level);
     _GLOBAL.set('sealedAt', Date.now());
     securityBus.emit('warn', 'system', `EchoMarkLedger 系统已封印，安全级别: ${level}`);
     return sealedExports;
 }
-// 便捷 API
-/**
- * 快速封印
- */
+
+/** ENHANCED + 存储加固，不开反调试。 */
 function quickSeal(onSecurityEvent) {
     return sealZeroTrustSystem({
-        level: SecurityLevel.ENHANCED,
-        onSecurityEvent,
-        hardenStorage: true,
-        enableDebugCountermeasures: false
+        level: SecurityLevel.ENHANCED, onSecurityEvent,
+        hardenStorage: true, enableDebugCountermeasures: false,
     });
 }
 
-/**
- * 最大防护
- */
+/** MAXIMUM 全开。 */
 function maximumSeal(onSecurityEvent) {
     return sealZeroTrustSystem({
-        level: SecurityLevel.MAXIMUM,
-        onSecurityEvent,
-        hardenStorage: true,
-        enableDebugCountermeasures: true
+        level: SecurityLevel.MAXIMUM, onSecurityEvent,
+        hardenStorage: true, enableDebugCountermeasures: true,
     });
 }
 
-/**
- * 包装已有引擎实例
- */
 function protectEngineInstance(engineInstance, options = {}) {
     return new SecureEngineProxy(engineInstance, options);
 }
 
-/**
- * 获取安全状态报告
- */
-function getSecurityReport() {
-    const fpResult = fingerprintEngine.verifyAll();
+async function getSecurityReport() {
     return {
         sealed: !!_GLOBAL.get('sealed'),
         level: _GLOBAL.get('securityLevel') || 'none',
         sealedAt: _GLOBAL.get('sealedAt'),
         operationsBlocked: securityBus.isBlocked(),
         selfDestructed: securityBus.isDestroyed(),
-        fingerprintStatus: fpResult,
-        recentEvents: securityBus.getHistory().slice(-20)
+        blockReason: securityBus.blockReason(),
+        fingerprintStatus: await fingerprintEngine.verifyAll(),
+        recentEvents: securityBus.getHistory().slice(-20),
     };
 }
+
 export {
-    sealZeroTrustSystem,
-    quickSeal,
-    maximumSeal,
-    protectEngineInstance,
-    getSecurityReport,
-    SecurityLevel,
-    SecurityEventBus,
-    FingerprintEngine,
-    AntiHookEngine,
-    SealingSystem,
-    SecureEngineProxy,
-    DebugCountermeasures,
-    StorageHardening,
-    securityBus,
-    fingerprintEngine,
-    antiHookEngine,
-    sealingSystem,
-    debugCountermeasures,
-    storageHardening
+    sealZeroTrustSystem, quickSeal, maximumSeal, protectEngineInstance, getSecurityReport,
+    SecurityLevel, SecurityEventBus, FingerprintEngine, AntiHookEngine, SealingSystem,
+    SecureEngineProxy, DebugCountermeasures, StorageHardening,
+    securityBus, fingerprintEngine, antiHookEngine, sealingSystem,
+    debugCountermeasures, storageHardening,
 };
 export default sealZeroTrustSystem;
